@@ -140,8 +140,8 @@ class CJEPA(nn.Module):
 
         # Eq. (3): masked token z_tilde_tau^i = phi(z_t0^i) + e_tau.
         mask_map = self._build_mask_map(B, T, N, M, z.device)
-        z_t0 = z_tok[:, 0]  # earliest time step t0
-        z_tilde = self.phi(z_t0).unsqueeze(1) + self.e_tau.view(1, T, 1, self.cfg.D) + tau_embed
+        z_t0_unembedded = self.slot_proj(z[:, 0])  # earliest time step t0 without tau_embed
+        z_tilde = self.phi(z_t0_unembedded).unsqueeze(1) + self.e_tau.view(1, T, 1, self.cfg.D) + tau_embed
 
         z_bar = torch.where(mask_map.unsqueeze(-1), z_tilde, z_tok)
 

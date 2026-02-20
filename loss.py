@@ -24,7 +24,7 @@ class CJEPALoss(nn.Module):
         B, T, N, _ = z_hat.shape
         z_target = z_target.detach()
 
-        sq_err = (z_hat - z_target).pow(2).mean(dim=-1)  # (B, T, N)
+        sq_err = (z_hat - z_target).pow(2).sum(dim=-1)  # (B, T, N)
         tau = torch.arange(T, device=z_hat.device).view(1, T, 1)
 
         history_selector = mask_map & (tau < self.T_h)
