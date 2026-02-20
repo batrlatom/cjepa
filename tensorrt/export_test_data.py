@@ -17,8 +17,8 @@ def main():
     # Generate requested number of Valid Sudoku Boards
     dataset = SudokuDataset(size=args.batch_size)
     
-    # Shape is (B, 81)
-    boards = dataset.data.squeeze().numpy().astype(np.int64)
+    # Shape is (B, 1, 81) -> want (B, 81)
+    boards = dataset.data.squeeze(1).numpy().astype(np.int64)
     
     # Generate masks (roughly half cells masked, ~40)
     masks = np.random.rand(args.batch_size, 81) > 0.5
