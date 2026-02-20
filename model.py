@@ -8,8 +8,8 @@ import torch.nn as nn
 @dataclass
 class CJEPAConfig:
     # Paper notation: N objects, latent slot dim d, model dim D.
-    N: int = 4
-    d: int = 128
+    N: int = 81
+    d: int = 10  # Vocab size for discrete logits (digits 0-9)
     D: int = 256
     n_heads: int = 8
     n_layers: int = 6
@@ -17,10 +17,8 @@ class CJEPAConfig:
     dropout: float = 0.0
 
     # History length T_h and prediction horizon T_p.
-    T_h: int = 3
-    T_p: int = 1
-
-    # Optional auxiliary variables U_t.
+    T_h: int = 1
+    T_p: int = 0
     aux_dim: int = 0
 
     @property
@@ -52,36 +50,34 @@ class TransformerBlock(nn.Module):
 
 class CJEPA(nn.Module):
     """
-    Minimal C-JEPA latent predictor.
-
-    Eq. (4): Z_hat_T = f(Z_bar_T)
-    Eq. (3): z_tilde_tau^i = phi(z_t0^i) + e_tau
+    Sudoku-adapted C-JEPA latent predictor.
+    Uses discrete embedding and spatial encoding.
     """
 
     def __init__(self, cfg: CJEPAConfig):
         super().__init__()
         self.cfg = cfg
 
-        self.slot_proj = nn.Linear(cfg.d, cfg.D)
-        self.aux_proj = nn.Linear(cfg.aux_dim, cfg.D) if cfg.aux_dim > 0 else None
+        self.slot_embed = nn.Embedding(cfg.d, cfg.D)
+        
+        # Spatial positional encoding for elements (e.g. 81 cells)
+        self.pos_pe = nn.Embedding(cfg.N, cfg.D)
 
-        # phi in Eq. (3), applied to identity anchor z_{t0}^i.
-        self.phi = nn.Linear(cfg.D, cfg.D)
-
-        # e_tau in Eq. (3), plus temporal position encoding.
-        self.e_tau = nn.Parameter(torch.zeros(cfg.T_total, cfg.D))
-        self.tau_pe = nn.Embedding(cfg.T_total, cfg.D)
+        # Mask embedding for predicting hidden states
+        self.e_mask = nn.Parameter(torch.zeros(1, 1, 1, cfg.D))
 
         self.blocks = nn.ModuleList(
             [TransformerBlock(cfg.D, cfg.n_heads, cfg.mlp_ratio, cfg.dropout) for _ in range(cfg.n_layers)]
         )
         self.norm = nn.LayerNorm(cfg.D)
+        
+        # Classification head
         self.head = nn.Linear(cfg.D, cfg.d)
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        nn.init.normal_(self.e_tau, std=0.02)
+        nn.init.normal_(self.e_mask, std=0.02)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
@@ -93,26 +89,21 @@ class CJEPA(nn.Module):
 
     def _build_mask_map(self, B: int, T: int, N: int, M: Optional[torch.Tensor], device: torch.device) -> torch.Tensor:
         """
-        Build mask indicator 1[z_bar_tau^i != z_tau^i] used in Eq. (5).
-
+        Build boolean indicator mask map.
         M format:
-          - None: no history object masking (future-only masking at inference).
-          - (B, N): object mask indices for history window.
-          - (B, T, N): explicit mask map.
+          - None: no masking
+          - (B, N): mask indices over objects
+          - (B, T, N): explicit mask
         """
-        tau = torch.arange(T, device=device).view(1, T, 1)
-        future_mask = (tau >= self.cfg.T_h).expand(B, T, N)
-
         if M is None:
-            history_mask = torch.zeros((B, T, N), dtype=torch.bool, device=device)
+            mask = torch.zeros((B, T, N), dtype=torch.bool, device=device)
         elif M.dim() == 2:
-            history_mask = (tau > 0) & (tau < self.cfg.T_h) & M.unsqueeze(1)
+            mask = M.unsqueeze(1).expand(B, T, N).bool()
         elif M.dim() == 3:
-            history_mask = M.bool()
+            mask = M.bool()
         else:
             raise ValueError(f"Expected M to have dim 2 or 3, got shape {tuple(M.shape)}")
-
-        return history_mask | future_mask
+        return mask
 
     def forward(
         self,
@@ -122,35 +113,30 @@ class CJEPA(nn.Module):
     ) -> dict:
         """
         Args:
-            z: object latents Z, shape (B, T, N, d)
-            u: optional auxiliaries U, shape (B, T, d_u)
-            M: mask indices over objects/tokens (see _build_mask_map)
+            z: discrete inputs, shape (B, T, N)
+            u: not used in Sudoku
+            M: mask indices over objects
 
         Returns:
             dict with z_hat, z_bar, and mask_map.
         """
-        B, T, N, _ = z.shape
+        B, T, N = z.shape[:3]
         if T != self.cfg.T_total:
             raise ValueError(f"Expected T={self.cfg.T_total}, got T={T}")
 
-        tau_idx = torch.arange(T, device=z.device).view(1, T)
-        tau_embed = self.tau_pe(tau_idx).unsqueeze(2)  # (1, T, 1, D)
+        pos_idx = torch.arange(N, device=z.device).view(1, 1, N)
+        pos_embed = self.pos_pe(pos_idx)  # (1, 1, N, D)
 
-        z_tok = self.slot_proj(z) + tau_embed  # tokenized Z
+        z_tok = self.slot_embed(z) + pos_embed  # tokenized and spatially encoded
 
-        # Eq. (3): masked token z_tilde_tau^i = phi(z_t0^i) + e_tau.
         mask_map = self._build_mask_map(B, T, N, M, z.device)
-        z_t0_unembedded = self.slot_proj(z[:, 0])  # earliest time step t0 without tau_embed
-        z_tilde = self.phi(z_t0_unembedded).unsqueeze(1) + self.e_tau.view(1, T, 1, self.cfg.D) + tau_embed
+        
+        z_tilde = self.e_mask + pos_embed
 
         z_bar = torch.where(mask_map.unsqueeze(-1), z_tilde, z_tok)
 
         tokens = z_bar
-        if self.aux_proj is not None and u is not None:
-            u_tok = self.aux_proj(u) + self.tau_pe(tau_idx)
-            tokens = torch.cat([tokens, u_tok.unsqueeze(2)], dim=2)
 
-        # Eq. (4): Z_hat_T = f(Z_bar_T)
         B2, T2, N_plus, D = tokens.shape
         x = tokens.view(B2, T2 * N_plus, D)
         for blk in self.blocks:
@@ -165,13 +151,3 @@ class CJEPA(nn.Module):
             "z_bar": z_bar,
             "mask_map": mask_map,
         }
-
-
-def sample_object_mask(B: int, N: int, m_min: int, m_max: int, device: torch.device) -> torch.Tensor:
-    """Sample M ~ Uniform({1,...,N}) style object masks used in C-JEPA training."""
-    k = torch.randint(low=m_min, high=m_max + 1, size=(B,), device=device)
-    M = torch.zeros((B, N), dtype=torch.bool, device=device)
-    for b in range(B):
-        idx = torch.randperm(N, device=device)[: k[b]]
-        M[b, idx] = True
-    return M
