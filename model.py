@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
@@ -77,6 +76,12 @@ class CJEPA(nn.Module):
             nn.GELU(),
             nn.Linear(cfg.D, cfg.pred_horizon * cfg.action_dim)
         )
+        # 5. Energy head (for CIME-style margin losses over trajectories)
+        self.energy_head = nn.Sequential(
+            nn.Linear(cfg.D + cfg.pred_horizon * cfg.action_dim, cfg.D),
+            nn.GELU(),
+            nn.Linear(cfg.D, 1),
+        )
 
         self._init_weights()
 
@@ -102,32 +107,69 @@ class CJEPA(nn.Module):
         ctx = torch.cat([vision_feats, proprio_feats], dim=-1)
         return self.context_norm(ctx)
 
+    def encode_summary(self, context_latent: torch.Tensor) -> torch.Tensor:
+        """
+        Encode context tokens and return pooled intent summary.
+        Input: context_latent (B, T_obs, context_dim)
+        Output: intent_summary (B, D)
+        """
+        _, T_obs, _ = context_latent.shape
+
+        # 1. Project to model dimension
+        tokens = self.context_token_proj(context_latent)  # (B, T_obs, D)
+
+        # 2. Add time positional PE
+        tokens = tokens + self.time_pos_embed[:, :T_obs, :]
+
+        # 3. Pass through Context Encoder
+        for block in self.context_encoder:
+            tokens = block(tokens)
+
+        # 4. Pool over time into a unified intent representation
+        return tokens.mean(dim=1)  # (B, D)
+
+    def predict_actions_from_summary(self, intent_summary: torch.Tensor) -> torch.Tensor:
+        """
+        Decode future action trajectory from summary latent.
+        Input: intent_summary (B, D)
+        Output: actions (B, pred_horizon, action_dim) in [-1, 1]
+        """
+        B = intent_summary.shape[0]
+        actions_flat = self.action_decoder(intent_summary)
+        actions = actions_flat.view(B, self.cfg.pred_horizon, self.cfg.action_dim)
+        return torch.tanh(actions)
+
+    def energy_from_summary(self, intent_summary: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Scalar energy for (context summary, action trajectory) pairs.
+        Input:
+            intent_summary: (B, D)
+            actions: (B, pred_horizon, action_dim)
+        Output:
+            energy: (B,)
+        """
+        if actions.ndim != 3:
+            raise ValueError(f"Expected actions with shape (B,T,D), got {tuple(actions.shape)}")
+        if actions.shape[1] != self.cfg.pred_horizon or actions.shape[2] != self.cfg.action_dim:
+            raise ValueError(
+                f"Expected actions shape (*,{self.cfg.pred_horizon},{self.cfg.action_dim}), got {tuple(actions.shape)}"
+            )
+        actions_flat = actions.reshape(actions.shape[0], -1)
+        e_in = torch.cat([intent_summary, actions_flat], dim=-1)
+        return self.energy_head(e_in).squeeze(-1)
+
+    def energy(self, context_latent: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Convenience wrapper to compute energy directly from context latents.
+        """
+        summary = self.encode_summary(context_latent)
+        return self.energy_from_summary(summary, actions)
+
     def forward(self, context_latent: torch.Tensor) -> torch.Tensor:
         """
         Main policy network prediction flow.
         Input: context_latent (B, T_obs, context_dim)
         Output: actions_pred (B, T_pred, action_dim)
         """
-        B, T_obs, _ = context_latent.shape
-        
-        # 1. Project to model dimension
-        tokens = self.context_token_proj(context_latent) # (B, T_obs, D)
-        
-        # 2. Add time positional PE
-        tokens = tokens + self.time_pos_embed[:, :T_obs, :]
-        
-        # 3. Pass through Context Encoder
-        for block in self.context_encoder:
-            tokens = block(tokens)
-            
-        # 4. Pooling: Mean over the observed time horizon to create a unified intent state
-        intent_summary = tokens.mean(dim=1) # (B, D)
-        
-        # 5. Decode intent directly into future action trajectory
-        # Note: In full JEPA, we would predict future latent states. 
-        # Here we do direct implicit behavior cloning decoding from the unified state.
-        actions_flat = self.action_decoder(intent_summary) # (B, pred_horizon * action_dim)
-        actions = actions_flat.view(B, self.cfg.pred_horizon, self.cfg.action_dim)
-        
-        # We enforce tanh bound to match standard min-max action normalization [-1, 1]
-        return torch.tanh(actions)
+        intent_summary = self.encode_summary(context_latent)
+        return self.predict_actions_from_summary(intent_summary)
