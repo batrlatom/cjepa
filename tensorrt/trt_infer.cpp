@@ -1,24 +1,26 @@
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <chrono>
-#include <random>
-#include <cassert>
-#include <cmath>
-
 #include <NvInfer.h>
 #include <cuda_runtime_api.h>
 
-#define CHECK(status) \
-    do { \
-        auto ret = (status); \
-        if (ret != 0) { \
-            std::cerr << "Cuda failure: " << ret << std::endl; \
-            abort(); \
-        } \
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
+
+#define CHECK(status)                                                          \
+    do {                                                                       \
+        const auto ret = (status);                                             \
+        if (ret != 0) {                                                        \
+            std::cerr << "CUDA failure: " << ret << std::endl;                 \
+            std::abort();                                                      \
+        }                                                                      \
     } while (0)
 
 class Logger : public nvinfer1::ILogger {
+  public:
     void log(Severity severity, const char* msg) noexcept override {
         if (severity <= Severity::kINFO) {
             std::cout << "[TRT] " << msg << std::endl;
@@ -26,152 +28,238 @@ class Logger : public nvinfer1::ILogger {
     }
 } gLogger;
 
-std::vector<char> loadEngineFile(const std::string& path) {
+static std::vector<char> loadEngineFile(const std::string& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
         std::cerr << "Error opening engine file: " << path << std::endl;
-        abort();
+        std::abort();
     }
-    std::streamsize size = file.tellg();
+    const std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
-    std::vector<char> buffer(size);
+    std::vector<char> buffer(static_cast<size_t>(size));
     if (!file.read(buffer.data(), size)) {
         std::cerr << "Error reading engine file" << std::endl;
-        abort();
+        std::abort();
     }
     return buffer;
 }
 
+static int64_t volume(const nvinfer1::Dims& dims) {
+    int64_t v = 1;
+    for (int i = 0; i < dims.nbDims; ++i) {
+        if (dims.d[i] < 0) {
+            return -1;
+        }
+        v *= static_cast<int64_t>(dims.d[i]);
+    }
+    return v;
+}
+
+static nvinfer1::Dims makeDims(std::initializer_list<int> values) {
+    nvinfer1::Dims d{};
+    d.nbDims = static_cast<int>(values.size());
+    int i = 0;
+    for (int v : values) {
+        d.d[i++] = v;
+    }
+    return d;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <engine_path> <batch_size>" << std::endl;
+        std::cerr << "Usage: " << argv[0]
+                  << " <engine_path> <batch_size> [obs_horizon=2] [num_cameras=2] "
+                  << "[image_size=84] [proprio_dim=7] [iterations=100]" << std::endl;
         return -1;
     }
-    
-    std::string enginePath = argv[1];
-    int BATCH_SIZE = std::stoi(argv[2]);
-    const int N_CELLS = 81;
-    const int D_VOCAB = 10;
-    
-    std::cout << "Loading TensorRT Engine..." << std::endl;
-    auto engineData = loadEngineFile(enginePath);
+
+    const std::string enginePath = argv[1];
+    const int batchSize = std::stoi(argv[2]);
+    const int obsHorizon = (argc > 3) ? std::stoi(argv[3]) : 2;
+    const int numCameras = (argc > 4) ? std::stoi(argv[4]) : 2;
+    const int imageSize = (argc > 5) ? std::stoi(argv[5]) : 84;
+    const int proprioDim = (argc > 6) ? std::stoi(argv[6]) : 7;
+    const int numIters = (argc > 7) ? std::stoi(argv[7]) : 100;
+    const int warmupIters = 10;
+
+    std::cout << "Loading TensorRT engine: " << enginePath << std::endl;
+    const auto engineData = loadEngineFile(enginePath);
+
     nvinfer1::IRuntime* runtime = nvinfer1::createInferRuntime(gLogger);
-    nvinfer1::ICudaEngine* engine = runtime->deserializeCudaEngine(engineData.data(), engineData.size());
-    nvinfer1::IExecutionContext* context = engine->createExecutionContext();
-    
-    // Set dynamic shapes
-    nvinfer1::Dims z_dims;
-    z_dims.nbDims = 3; z_dims.d[0] = BATCH_SIZE; z_dims.d[1] = 1; z_dims.d[2] = N_CELLS;
-    context->setInputShape("z", z_dims);
-    
-    nvinfer1::Dims m_dims;
-    m_dims.nbDims = 2; m_dims.d[0] = BATCH_SIZE; m_dims.d[1] = N_CELLS;
-    context->setInputShape("M", m_dims);
-    
-    // Allocate host memory
-    size_t z_size = BATCH_SIZE * 1 * N_CELLS * sizeof(int64_t);
-    size_t m_size = BATCH_SIZE * N_CELLS * sizeof(bool); // bool in ONNX maps to 1 byte C++
-    size_t out_size = BATCH_SIZE * 1 * N_CELLS * D_VOCAB * sizeof(float);
-    
-    std::vector<int64_t> h_z(BATCH_SIZE * N_CELLS);
-    std::vector<uint8_t> h_m(BATCH_SIZE * N_CELLS); // using uint8_t for bool to get raw data pointer
-    std::vector<float> h_out(BATCH_SIZE * N_CELLS * D_VOCAB);
-    
-    // Load board and mask data from binary export script
-    std::ifstream data_file("../sudoku_test_boards.bin", std::ios::binary);
-    if (!data_file) {
-        std::cerr << "Error opening data file! Did you run export_test_data.py?" << std::endl;
-        abort();
+    if (runtime == nullptr) {
+        std::cerr << "Failed to create TensorRT runtime" << std::endl;
+        return -1;
     }
-    
-    data_file.read(reinterpret_cast<char*>(h_z.data()), BATCH_SIZE * N_CELLS * sizeof(int64_t));
-    data_file.read(reinterpret_cast<char*>(h_m.data()), BATCH_SIZE * N_CELLS * sizeof(uint8_t));
-    
-    std::cout << "Successfully loaded " << BATCH_SIZE << " real generated Sudoku boards!" << std::endl;
-    
-    // Allocate device memory
-    void* d_z;
-    void* d_m;
-    void* d_out;
-    CHECK(cudaMalloc(&d_z, z_size));
-    CHECK(cudaMalloc(&d_m, m_size));
-    CHECK(cudaMalloc(&d_out, out_size));
-    
-    // Create CUDA stream
+    nvinfer1::ICudaEngine* engine = runtime->deserializeCudaEngine(engineData.data(), engineData.size());
+    if (engine == nullptr) {
+        std::cerr << "Failed to deserialize engine" << std::endl;
+        delete runtime;
+        return -1;
+    }
+    nvinfer1::IExecutionContext* context = engine->createExecutionContext();
+    if (context == nullptr) {
+        std::cerr << "Failed to create execution context" << std::endl;
+        delete engine;
+        delete runtime;
+        return -1;
+    }
+
+    const char* imagesName = "images";
+    const char* proprioName = "proprio";
+    const char* outputName = "pred_actions";
+
+    const nvinfer1::Dims imagesDims = makeDims({batchSize, obsHorizon, numCameras, 3, imageSize, imageSize});
+    const nvinfer1::Dims proprioDims = makeDims({batchSize, obsHorizon, proprioDim});
+
+    if (!context->setInputShape(imagesName, imagesDims)) {
+        std::cerr << "Failed to set input shape for " << imagesName << std::endl;
+        delete context;
+        delete engine;
+        delete runtime;
+        return -1;
+    }
+    if (!context->setInputShape(proprioName, proprioDims)) {
+        std::cerr << "Failed to set input shape for " << proprioName << std::endl;
+        delete context;
+        delete engine;
+        delete runtime;
+        return -1;
+    }
+
+    const nvinfer1::Dims outputDims = context->getTensorShape(outputName);
+    const int64_t outElems = volume(outputDims);
+    if (outElems <= 0) {
+        std::cerr << "Invalid output shape for " << outputName << std::endl;
+        delete context;
+        delete engine;
+        delete runtime;
+        return -1;
+    }
+
+    const size_t imagesElems = static_cast<size_t>(batchSize) * obsHorizon * numCameras * 3 * imageSize * imageSize;
+    const size_t proprioElems = static_cast<size_t>(batchSize) * obsHorizon * proprioDim;
+    const size_t outputElems = static_cast<size_t>(outElems);
+
+    std::vector<float> hImages(imagesElems);
+    std::vector<float> hProprio(proprioElems);
+    std::vector<float> hOutput(outputElems);
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> normalDist(0.0f, 1.0f);
+    for (auto& x : hImages) {
+        x = normalDist(rng);
+    }
+    for (auto& x : hProprio) {
+        x = normalDist(rng);
+    }
+
+    void* dImages = nullptr;
+    void* dProprio = nullptr;
+    void* dOutput = nullptr;
+    const size_t imagesBytes = imagesElems * sizeof(float);
+    const size_t proprioBytes = proprioElems * sizeof(float);
+    const size_t outputBytes = outputElems * sizeof(float);
+
+    CHECK(cudaMalloc(&dImages, imagesBytes));
+    CHECK(cudaMalloc(&dProprio, proprioBytes));
+    CHECK(cudaMalloc(&dOutput, outputBytes));
+
     cudaStream_t stream;
     CHECK(cudaStreamCreate(&stream));
-    
+
+    if (!context->setTensorAddress(imagesName, dImages) ||
+        !context->setTensorAddress(proprioName, dProprio) ||
+        !context->setTensorAddress(outputName, dOutput)) {
+        std::cerr << "Failed to set one or more tensor addresses" << std::endl;
+        cudaStreamDestroy(stream);
+        cudaFree(dImages);
+        cudaFree(dProprio);
+        cudaFree(dOutput);
+        delete context;
+        delete engine;
+        delete runtime;
+        return -1;
+    }
+
     std::cout << "Warming up..." << std::endl;
-    for (int i = 0; i < 10; ++i) {
-        CHECK(cudaMemcpyAsync(d_z, h_z.data(), z_size, cudaMemcpyHostToDevice, stream));
-        CHECK(cudaMemcpyAsync(d_m, h_m.data(), m_size, cudaMemcpyHostToDevice, stream));
-        context->setTensorAddress("z", d_z);
-        context->setTensorAddress("M", d_m);
-        context->setTensorAddress("z_hat", d_out);
-        context->enqueueV3(stream);
-        CHECK(cudaMemcpyAsync(h_out.data(), d_out, out_size, cudaMemcpyDeviceToHost, stream));
-        cudaStreamSynchronize(stream);
+    for (int i = 0; i < warmupIters; ++i) {
+        CHECK(cudaMemcpyAsync(dImages, hImages.data(), imagesBytes, cudaMemcpyHostToDevice, stream));
+        CHECK(cudaMemcpyAsync(dProprio, hProprio.data(), proprioBytes, cudaMemcpyHostToDevice, stream));
+        if (!context->enqueueV3(stream)) {
+            std::cerr << "enqueueV3 failed during warmup" << std::endl;
+            cudaStreamDestroy(stream);
+            cudaFree(dImages);
+            cudaFree(dProprio);
+            cudaFree(dOutput);
+            delete context;
+            delete engine;
+            delete runtime;
+            return -1;
+        }
+        CHECK(cudaMemcpyAsync(hOutput.data(), dOutput, outputBytes, cudaMemcpyDeviceToHost, stream));
+        CHECK(cudaStreamSynchronize(stream));
     }
-    
+
     std::cout << "Running benchmark..." << std::endl;
-    int num_iters = 100;
-    auto start = std::chrono::high_resolution_clock::now();
-    
-    for (int i = 0; i < num_iters; ++i) {
-        CHECK(cudaMemcpyAsync(d_z, h_z.data(), z_size, cudaMemcpyHostToDevice, stream));
-        CHECK(cudaMemcpyAsync(d_m, h_m.data(), m_size, cudaMemcpyHostToDevice, stream));
-        context->enqueueV3(stream);
-        CHECK(cudaMemcpyAsync(h_out.data(), d_out, out_size, cudaMemcpyDeviceToHost, stream));
+    const auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < numIters; ++i) {
+        CHECK(cudaMemcpyAsync(dImages, hImages.data(), imagesBytes, cudaMemcpyHostToDevice, stream));
+        CHECK(cudaMemcpyAsync(dProprio, hProprio.data(), proprioBytes, cudaMemcpyHostToDevice, stream));
+        if (!context->enqueueV3(stream)) {
+            std::cerr << "enqueueV3 failed during benchmark" << std::endl;
+            cudaStreamDestroy(stream);
+            cudaFree(dImages);
+            cudaFree(dProprio);
+            cudaFree(dOutput);
+            delete context;
+            delete engine;
+            delete runtime;
+            return -1;
+        }
+        CHECK(cudaMemcpyAsync(hOutput.data(), dOutput, outputBytes, cudaMemcpyDeviceToHost, stream));
     }
-    cudaStreamSynchronize(stream);
-    
-    auto end = std::chrono::high_resolution_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
-    double avg_ms = total_ms / num_iters;
-    
+    CHECK(cudaStreamSynchronize(stream));
+    const auto end = std::chrono::high_resolution_clock::now();
+
+    const double totalMs = std::chrono::duration<double, std::milli>(end - start).count();
+    const double avgMs = totalMs / static_cast<double>(numIters);
+    const double throughput = (batchSize * 1000.0) / avgMs;
+
     std::cout << "=====================================" << std::endl;
-    std::cout << "Batch Size: " << BATCH_SIZE << std::endl;
-    std::cout << "Avg Latency: " << avg_ms << " ms" << std::endl;
-    std::cout << "Throughput: " << (BATCH_SIZE * 1000.0) / avg_ms << " sequences/sec" << std::endl;
+    std::cout << "Task: Robomimic policy inference" << std::endl;
+    std::cout << "Batch Size: " << batchSize << std::endl;
+    std::cout << "Input images shape: (" << batchSize << "," << obsHorizon << "," << numCameras
+              << ",3," << imageSize << "," << imageSize << ")" << std::endl;
+    std::cout << "Input proprio shape: (" << batchSize << "," << obsHorizon << "," << proprioDim << ")" << std::endl;
+    std::cout << "Output pred_actions dims:";
+    for (int i = 0; i < outputDims.nbDims; ++i) {
+        std::cout << (i == 0 ? " (" : ",") << outputDims.d[i];
+    }
+    std::cout << ")" << std::endl;
+    std::cout << "Avg Latency: " << avgMs << " ms" << std::endl;
+    std::cout << "Throughput: " << throughput << " sequences/sec" << std::endl;
     std::cout << "=====================================" << std::endl;
-    
-    // Verify accuracy metric behavior
-    int correct_masks = 0;
-    int total_masks = 0;
-    
-    for (int b = 0; b < BATCH_SIZE; ++b) {
-        for (int i = 0; i < N_CELLS; ++i) {
-            int idx = b * N_CELLS + i;
-            if (h_m[idx]) {
-                total_masks++;
-                
-                int max_digit = 0;
-                float max_val = -1e9;
-                for (int v = 0; v < D_VOCAB; ++v) {
-                    float val = h_out[idx * D_VOCAB + v];
-                    if (val > max_val) {
-                        max_val = val;
-                        max_digit = v;
-                    }
-                }
-                
-                if (max_digit == h_z[idx]) {
-                    correct_masks++;
-                }
+
+    // Preview first predicted action for batch element 0, horizon step 0.
+    if (outputDims.nbDims == 3 && outputDims.d[1] > 0 && outputDims.d[2] > 0) {
+        const int actionDim = outputDims.d[2];
+        std::cout << "Pred action[0,0,:] = [";
+        for (int i = 0; i < actionDim; ++i) {
+            const float v = hOutput[static_cast<size_t>(i)];
+            std::cout << v;
+            if (i + 1 < actionDim) {
+                std::cout << ", ";
             }
         }
+        std::cout << "]" << std::endl;
     }
-    
-    std::cout << "Sanity check precision (randomized fake inputs): " 
-              << (float)correct_masks / std::max(1, total_masks) * 100.0f << " %" << std::endl;
-              
-    cudaStreamDestroy(stream);
-    cudaFree(d_z);
-    cudaFree(d_m);
-    cudaFree(d_out);
+
+    CHECK(cudaStreamDestroy(stream));
+    CHECK(cudaFree(dImages));
+    CHECK(cudaFree(dProprio));
+    CHECK(cudaFree(dOutput));
     delete context;
     delete engine;
     delete runtime;
-    
     return 0;
 }

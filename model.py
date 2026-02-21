@@ -7,7 +7,7 @@ from dataclasses import dataclass
 class CJEPAConfig:
     # Environment configs (Robomimic)
     action_dim: int = 7     # Control dimensions
-    proprio_dim: int = 14   # Proprioception state dim
+    proprio_dim: int = 7    # Proprioception state dim
     vision_dim: int = 512   # CNN flat output dim
     
     # Model configs
@@ -95,7 +95,7 @@ class CJEPA(nn.Module):
     def encode_context(self, vision_feats: torch.Tensor, proprio_feats: torch.Tensor) -> torch.Tensor:
         """
         vision_feats: (B, T_obs, 512)
-        proprio_feats: (B, T_obs, 14)
+        proprio_feats: (B, T_obs, 7)
         Returns flattened fused latents ready for transformer.
         """
         # Ensure they match time wise
